@@ -4,6 +4,10 @@ use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
     Aes256Gcm, Key, Nonce,
 };
+use aes_siv::{
+    aead::Payload,
+    Aes256SivAead,
+};
 use rand::{RngCore, rngs::OsRng as RandOsRng};
 use std::convert::TryInto;
 use wasm_bindgen::prelude::*;
@@ -161,12 +165,14 @@ pub fn decrypt_to_string(encrypted_data: &[u8], key: &[u8]) -> Result<String> {
 /// Encrypts data using AES-256-SIV mode for misuse-resistant encryption
 ///
 /// # Security
-/// This is a simplified version that approximates SIV functionality.
-/// Currently implemented using standard AES-GCM for compatibility.
+/// Uses AES-256-SIV for misuse-resistant authenticated encryption.
+/// This is suitable for scenarios where nonce reuse might occur, as SIV mode
+/// maintains confidentiality even with repeated nonces (though it will leak
+/// if identical messages are encrypted with the same key and AD).
 /// 
 /// # Parameters
 /// * `data` - Data to encrypt (can be text or binary)
-/// * `key` - 32-byte encryption key
+/// * `key` - 64-byte encryption key (512 bits)
 /// * `associated_data` - Optional additional authenticated data
 ///
 /// # Returns
@@ -177,32 +183,54 @@ pub fn encrypt_data_siv(
     key: &[u8], 
     associated_data: Option<Box<[u8]>>
 ) -> Result<Box<[u8]>> {
-    // For now, we'll simplify and use standard AES-GCM
-    // We can implement true SIV mode in a future version
-    
-    // Validate inputs - Standard 32-byte key
-    if key.len() != 32 {
+    // Validate inputs - SIV requires a 64-byte key (512 bits)
+    if key.len() != 64 {
         log_crypto_error("encrypt_data_siv", &SecureTrackError::InvalidInputError);
         return Err(SecureTrackError::InvalidInputError);
     }
     
-    // Use standard AES-GCM based on whether additional data is provided
-    if let Some(ad) = associated_data {
-        encrypt_data_with_ad(data, key, &ad)
-    } else {
-        encrypt_data(data, key)
-    }
+    // Create AES-256-SIV cipher
+    let cipher = Aes256SivAead::new_from_slice(key)
+        .map_err(|_| {
+            log_crypto_error("encrypt_data_siv", &SecureTrackError::EncryptionError);
+            SecureTrackError::EncryptionError
+        })?;
+    
+    // Encrypt with or without additional data
+    let ciphertext = match associated_data {
+        Some(ad) => {
+            let payload = Payload {
+                msg: data,
+                aad: &ad,
+            };
+            cipher.encrypt(&Nonce::default(), payload)
+                .map_err(|_| {
+                    log_crypto_error("encrypt_data_siv", &SecureTrackError::EncryptionError);
+                    SecureTrackError::EncryptionError
+                })?
+        },
+        None => {
+            cipher.encrypt(&Nonce::default(), data)
+                .map_err(|_| {
+                    log_crypto_error("encrypt_data_siv", &SecureTrackError::EncryptionError);
+                    SecureTrackError::EncryptionError
+                })?
+        }
+    };
+    
+    Ok(ciphertext.into_boxed_slice())
 }
 
 /// Decrypts data that was encrypted with AES-256-SIV
 ///
 /// # Security
-/// This is a simplified version that approximates SIV functionality.
-/// Currently implemented using standard AES-GCM for compatibility.
+/// Uses AES-256-SIV for misuse-resistant authenticated decryption.
+/// Maintains confidentiality even if nonces are reused, making it
+/// more robust for systems where proper nonce management is difficult.
 ///
 /// # Parameters
 /// * `encrypted_data` - Encrypted data
-/// * `key` - 32-byte decryption key
+/// * `key` - 64-byte decryption key (512 bits)
 /// * `associated_data` - Optional additional authenticated data (must match encryption)
 ///
 /// # Returns
@@ -213,33 +241,55 @@ pub fn decrypt_data_siv(
     key: &[u8], 
     associated_data: Option<Box<[u8]>>
 ) -> Result<Box<[u8]>> {
-    // For now, we'll simplify and use standard AES-GCM
-    // We can implement true SIV mode in a future version
-    
-    // Validate inputs - Standard 32-byte key
-    if key.len() != 32 {
+    // Validate inputs - SIV requires a 64-byte key (512 bits)
+    if key.len() != 64 {
         log_crypto_error("decrypt_data_siv", &SecureTrackError::InvalidInputError);
         return Err(SecureTrackError::InvalidInputError);
     }
     
-    // Use standard AES-GCM based on whether additional data is provided
-    if let Some(ad) = associated_data {
-        decrypt_data_with_ad(encrypted_data, key, &ad)
-    } else {
-        decrypt_data(encrypted_data, key)
-    }
+    // Create AES-256-SIV cipher
+    let cipher = Aes256SivAead::new_from_slice(key)
+        .map_err(|_| {
+            log_crypto_error("decrypt_data_siv", &SecureTrackError::DecryptionError);
+            SecureTrackError::DecryptionError
+        })?;
+    
+    // Decrypt with or without additional data
+    let plaintext = match associated_data {
+        Some(ad) => {
+            let payload = Payload {
+                msg: encrypted_data,
+                aad: &ad,
+            };
+            cipher.decrypt(&Nonce::default(), payload)
+                .map_err(|_| {
+                    log_crypto_error("decrypt_data_siv", &SecureTrackError::DecryptionError);
+                    SecureTrackError::DecryptionError
+                })?
+        },
+        None => {
+            cipher.decrypt(&Nonce::default(), encrypted_data)
+                .map_err(|_| {
+                    log_crypto_error("decrypt_data_siv", &SecureTrackError::DecryptionError);
+                    SecureTrackError::DecryptionError
+                })?
+        }
+    };
+    
+    Ok(plaintext.into_boxed_slice())
 }
 
-/// Generates a key for AES encryption
+/// Generates a key for AES-SIV encryption
 ///
 /// # Security
-/// Generates a 32-byte key (256 bits) suitable for AES-256-GCM encryption.
+/// Generates a 64-byte key (512 bits) suitable for AES-256-SIV encryption.
+/// AES-SIV requires a key twice the size of standard AES.
 ///
 /// # Returns
-/// * 32-byte random key as a boxed slice
+/// * 64-byte random key as a boxed slice
 #[wasm_bindgen]
 pub fn generate_siv_key() -> Box<[u8]> {
-    let mut key = vec![0u8; 32];
+    let mut key = vec![0u8; 64]; // 512 bits = 64 bytes for AES-256-SIV
     RandOsRng.fill_bytes(&mut key);
     key.into_boxed_slice()
 }
@@ -247,19 +297,19 @@ pub fn generate_siv_key() -> Box<[u8]> {
 /// Encrypts data using AES-256-GCM with additional authenticated data
 ///
 /// # Security
-/// Uses AES-256-GCM which provides both confidentiality and authenticity.
-/// This version allows specifying additional authenticated data (AAD) that
-/// will be authenticated but not encrypted.
+/// Uses AES-256-GCM with additional authenticated data (AAD). The AAD is authenticated
+/// but not encrypted, providing integrity protection for metadata without revealing 
+/// the actual encrypted content.
 ///
 /// # Parameters
-/// * `data` - Data to encrypt (can be text or binary)
+/// * `data` - Data to encrypt
 /// * `key` - 32-byte encryption key
 /// * `aad` - Additional authenticated data
 ///
 /// # Returns
 /// * Encrypted data (nonce + ciphertext + tag) as a boxed slice
 #[wasm_bindgen]
-pub fn encrypt_data_with_ad(data: &[u8], key: &[u8], _aad: &[u8]) -> Result<Box<[u8]>> {
+pub fn encrypt_data_with_ad(data: &[u8], key: &[u8], aad: &[u8]) -> Result<Box<[u8]>> {
     // Validate inputs
     if key.len() != 32 {
         log_crypto_error("encrypt_data_with_ad", &SecureTrackError::InvalidInputError);
@@ -281,9 +331,8 @@ pub fn encrypt_data_with_ad(data: &[u8], key: &[u8], _aad: &[u8]) -> Result<Box<
     // Verify nonce size matches our constant
     debug_assert_eq!(nonce.len(), AES_GCM_NONCE_SIZE);
     
-    // Encrypt the data with AAD - Note: Currently not using AAD due to library limitations
-    // TODO: Implement true AAD support in a future version
-    let ciphertext = cipher.encrypt(&nonce, data)
+    // Encrypt the data with the associated data
+    let ciphertext = cipher.encrypt(&nonce, Payload { msg: data, aad })
         .map_err(|_| {
             log_crypto_error("encrypt_data_with_ad", &SecureTrackError::EncryptionError);
             SecureTrackError::EncryptionError
@@ -297,21 +346,22 @@ pub fn encrypt_data_with_ad(data: &[u8], key: &[u8], _aad: &[u8]) -> Result<Box<
     Ok(result.into_boxed_slice())
 }
 
-/// Decrypts data that was encrypted with AES-256-GCM and additional authenticated data
+/// Decrypts data that was encrypted with AES-256-GCM and AAD
 ///
 /// # Security
-/// Decrypts and verifies the authenticity of data encrypted with AES-256-GCM.
-/// Also verifies the integrity of the additional authenticated data (AAD).
+/// Decrypts and verifies the authenticity of data encrypted with AES-256-GCM
+/// and additional authenticated data (AAD). Both the ciphertext and AAD must
+/// be authentic for decryption to succeed.
 ///
 /// # Parameters
 /// * `encrypted_data` - Encrypted data (nonce + ciphertext + tag)
 /// * `key` - 32-byte decryption key
-/// * `aad` - Additional authenticated data
+/// * `aad` - Additional authenticated data (must match encryption)
 ///
 /// # Returns
 /// * Decrypted data as a boxed slice
 #[wasm_bindgen]
-pub fn decrypt_data_with_ad(encrypted_data: &[u8], key: &[u8], _aad: &[u8]) -> Result<Box<[u8]>> {
+pub fn decrypt_data_with_ad(encrypted_data: &[u8], key: &[u8], aad: &[u8]) -> Result<Box<[u8]>> {
     // Validate inputs
     if key.len() != 32 {
         log_crypto_error("decrypt_data_with_ad", &SecureTrackError::InvalidInputError);
@@ -341,9 +391,8 @@ pub fn decrypt_data_with_ad(encrypted_data: &[u8], key: &[u8], _aad: &[u8]) -> R
     // Create nonce from extracted bytes
     let nonce = Nonce::from_slice(nonce_bytes);
     
-    // Decrypt and verify with AAD - Note: Currently not using AAD due to library limitations
-    // TODO: Implement true AAD support in a future version
-    let plaintext = cipher.decrypt(nonce, ciphertext)
+    // Decrypt and verify with the additional authenticated data
+    let plaintext = cipher.decrypt(nonce, Payload { msg: ciphertext, aad })
         .map_err(|_| {
             log_crypto_error("decrypt_data_with_ad", &SecureTrackError::DecryptionError);
             SecureTrackError::DecryptionError

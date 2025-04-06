@@ -147,16 +147,16 @@ This module implements key splitting for secure backup and recovery.
 
 **Core Functions:**
 
-- `split_key`: Splits a key into n shares with k-threshold reconstruction
+- `split_key`: Splits a key into n shares requiring all n shares for reconstruction
 - `combine_key`: Recombines shares to recover the original key
 
 **Security Features:**
 
-- Threshold cryptography (requires a minimum number of shares)
+- XOR-based secret sharing (all shares required for reconstruction)
 - Secure serialization format for shares
 - Input validation for security parameters
 
-The module provides a simplified implementation of Shamir's Secret Sharing designed for testing, with clear documentation about its limitations for production use.
+The module provides a simple and reliable XOR-based secret sharing implementation that requires all shares to reconstruct the original key. This approach is cryptographically secure when all shares are stored separately and securely, making it suitable for backup scenarios. Unlike traditional Shamir's Secret Sharing, this implementation does not support arbitrary k-of-n thresholds where k<n, but instead enforces that all shares must be present for reconstruction (n-of-n).
 
 ## Library Interface (lib.rs)
 

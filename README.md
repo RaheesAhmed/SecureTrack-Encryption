@@ -6,11 +6,12 @@ A secure, WASM-ready cryptographic library for the SecureTrack anti-theft app. T
 
 - WASM-compatible crypto primitives with wasm-bindgen exports
 - AES-256-GCM authenticated encryption
+- AES-256-SIV for misuse-resistant encryption
 - Argon2id and PBKDF2 key derivation functions
 - Hardware-bound key generation for multi-factor security
 - Memory-protected secure containers with automatic wiping
 - HMAC-SHA256 signing and verification
-- Shamir's Secret Sharing for secure key backup
+- XOR-based secret sharing for secure key backup
 - Constant-time comparisons and secure memory wiping
 - Comprehensive error handling with detailed diagnostics
 - Entropy measurement for password strength assessment
@@ -84,8 +85,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let is_valid = verify_command(command, &signature, &key)?;
     assert!(is_valid);
 
-    // Step 7: Split the key for secure backup (5 shares, need 3 to reconstruct)
-    let shares = split_key(&key, 5, 3)?;
+    // Step 7: Split the key for secure backup (needs all shares to reconstruct)
+    let shares = split_key(&key, 3, 3)?;
 
     // Later, reconstruct the key from the shares
     let recovered_key = combine_key(&shares)?;
@@ -157,8 +158,8 @@ async function secureDemo() {
   const isValid = crypto.verify_command(command, signature, key);
   console.log("Signature valid:", isValid);
 
-  // Split the key for secure backup (5 shares, need 3)
-  const shares = crypto.split_key(key, 5, 3);
+  // Split the key for secure backup (5 shares, need all 5)
+  const shares = crypto.split_key(key, 5, 5);
 
   // Later reconstruct the key from shares
   const recoveredKey = crypto.combine_key(shares);
@@ -230,9 +231,10 @@ wasmRuntime.callFunction(
 ## Security Considerations
 
 - The library uses AES-256-GCM for authenticated encryption, which provides both confidentiality and integrity.
+- AES-256-SIV provides misuse-resistant encryption that maintains confidentiality even with nonce reuse.
 - Argon2id (winner of the Password Hashing Competition) provides superior protection against brute-force attacks compared to PBKDF2.
 - PBKDF2 with HMAC-SHA256 uses 100,000 iterations by default for legacy key derivation.
-- The Shamir's Secret Sharing implementation enables secure key backup and recovery.
+- The XOR-based secret sharing implementation enables secure key backup and recovery when all shares are available.
 - Memory-protected containers (`SecretBytes`) automatically wipe sensitive data when no longer needed.
 - All cryptographic operations use constant-time algorithms where possible to avoid timing attacks.
 - Detailed error handling with unique error codes aids in security diagnostics without leaking sensitive information.

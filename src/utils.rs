@@ -4,14 +4,16 @@ use rand::{RngCore, rngs::OsRng};
 use wasm_bindgen::prelude::*;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
+use zeroize::{Zeroize, Zeroizing};
 
 /// A secure container for sensitive data that will be wiped on drop
 /// 
 /// # Security
 /// SecretBytes holds sensitive data (like keys, passwords) in memory
-/// and automatically zeros out memory when dropped.
+/// and automatically zeros out memory when dropped using the zeroize crate,
+/// which ensures memory is properly cleared even with compiler optimizations.
 pub struct SecretBytes {
-    bytes: Vec<u8>,
+    bytes: Zeroizing<Vec<u8>>,
 }
 
 impl SecretBytes {
@@ -19,26 +21,28 @@ impl SecretBytes {
     pub fn new(data: &[u8]) -> Self {
         let mut bytes = vec![0u8; data.len()];
         bytes.copy_from_slice(data);
-        Self { bytes }
+        Self { bytes: Zeroizing::new(bytes) }
     }
     
     /// Generate random bytes for this container
     pub fn random(length: usize) -> Self {
         let mut bytes = vec![0u8; length];
         OsRng.fill_bytes(&mut bytes);
-        Self { bytes }
+        Self { bytes: Zeroizing::new(bytes) }
     }
     
     /// Convert to a boxed slice (does not zero original memory)
     pub fn into_boxed_slice(&self) -> Box<[u8]> {
-        self.bytes.clone().into_boxed_slice()
+        self.bytes.to_vec().into_boxed_slice()
     }
     
     /// Convert to a boxed slice, securely zeroing the original memory
+    /// Note: The memory will still be zeroed when self is dropped,
+    /// but this method can be used when you want to control the exact timing.
     pub fn into_boxed_slice_secure(&mut self) -> Box<[u8]> {
-        let result = self.bytes.clone().into_boxed_slice();
-        secure_zero(&mut self.bytes);
-        self.bytes.clear();
+        let result = self.bytes.to_vec().into_boxed_slice();
+        // The memory will be zeroed when bytes is dropped
+        self.bytes = Zeroizing::new(Vec::new());
         result
     }
 }
@@ -51,15 +55,11 @@ impl Deref for SecretBytes {
     }
 }
 
+// Note: DerefMut is still provided but should be used carefully since it could
+// lead to unzeroized copies. Consider direct methods instead when possible.
 impl DerefMut for SecretBytes {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.bytes
-    }
-}
-
-impl Drop for SecretBytes {
-    fn drop(&mut self) {
-        secure_zero(&mut self.bytes);
     }
 }
 
@@ -92,7 +92,8 @@ pub fn generate_random_key(length: usize) -> Box<[u8]> {
 ///
 /// # Security
 /// This function creates a container for sensitive data that will be
-/// automatically zeroed when it goes out of scope.
+/// automatically zeroed when it goes out of scope using the zeroize crate,
+/// which ensures memory is properly cleared even with compiler optimizations.
 ///
 /// # Parameters
 /// * `data` - The sensitive data to protect
@@ -147,22 +148,14 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 ///
 /// # Security
 /// This function helps prevent sensitive data from lingering in memory
-/// by explicitly overwriting it with zeros. Note that Rust's compiler
-/// optimizations may affect its behavior.
+/// by explicitly overwriting it with zeros using the zeroize crate,
+/// which ensures memory is properly cleared even with compiler optimizations.
 ///
 /// # Parameters
 /// * `data` - Data to zero out
 #[wasm_bindgen]
 pub fn secure_zero(data: &mut [u8]) {
-    // Use volatile writes to prevent optimizations
-    for i in 0..data.len() {
-        unsafe {
-            std::ptr::write_volatile(data.as_mut_ptr().add(i), 0);
-        }
-    }
-    
-    // Compiler fence to prevent reordering
-    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    data.zeroize();
 }
 
 /// Converts a hexadecimal string to bytes

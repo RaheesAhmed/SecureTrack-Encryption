@@ -1,7 +1,7 @@
 use crate::config::SecurityConfig;
 use crate::errors::{Result, SecureTrackError, log_crypto_error};
 use crate::utils::SecretBytes;
-use hmac::{Hmac};
+use hmac::{Hmac, Mac};
 use pbkdf2::pbkdf2;
 use argon2::{Argon2, Algorithm, Version, Params};
 use rand::{RngCore, rngs::OsRng};
@@ -191,22 +191,68 @@ pub fn derive_key_hardware_bound(
     hardware_id: &str,
     config: Option<Argon2Config>
 ) -> Result<Box<[u8]>> {
-    // Combine the password with biometric and hardware factors
-    let mut enhanced_password = String::with_capacity(
-        password.len() + biometric_factor.len() + hardware_id.len()
+    // Generate a salt if not provided in config
+    let config = config.unwrap_or_default();
+    let mut salt = vec![0u8; config.salt_length as usize];
+    OsRng.fill_bytes(&mut salt);
+    
+    // First derive an intermediate key from the password
+    let mut hmac_key = [0u8; 32];
+    let _ = pbkdf2::<Hmac<Sha256>>(
+        password.as_bytes(),
+        &salt,
+        10000, // Use a reasonable number of iterations for this step
+        &mut hmac_key
+    ).map_err(|_| {
+        log_crypto_error("derive_key_hardware_bound", &SecureTrackError::KeyDerivationError);
+        SecureTrackError::KeyDerivationError
+    })?;
+    
+    // Use the intermediate key to create an HMAC of the biometric factor
+    let mut mac = Hmac::<Sha256>::new_from_slice(&hmac_key)
+        .map_err(|_| {
+            log_crypto_error("derive_key_hardware_bound", &SecureTrackError::KeyDerivationError);
+            SecureTrackError::KeyDerivationError
+        })?;
+    
+    mac.update(biometric_factor);
+    mac.update(hardware_id.as_bytes());
+    
+    // Get the HMAC result
+    let combined_factor_hash = mac.finalize().into_bytes();
+    
+    // Use Argon2id for the final key derivation with the combined factors
+    let argon2 = Argon2::new(
+        Algorithm::Argon2id,
+        Version::V0x13,
+        Params::new(
+            config.memory_size_kib,
+            config.iterations,
+            config.parallelism,
+            Some(config.output_length as usize)
+        ).map_err(|_| {
+            log_crypto_error("derive_key_hardware_bound", &SecureTrackError::KeyDerivationError);
+            SecureTrackError::KeyDerivationError
+        })?
     );
-    enhanced_password.push_str(password);
     
-    // Add hex-encoded biometric factor
-    for byte in biometric_factor {
-        enhanced_password.push_str(&format!("{:02x}", byte));
-    }
+    // Derive the final key using the HMAC result as the password
+    let mut output = SecretBytes::new(&vec![0u8; config.output_length as usize]);
+    argon2.hash_password_into(
+        &combined_factor_hash,
+        &salt,
+        &mut output
+    ).map_err(|_| {
+        log_crypto_error("derive_key_hardware_bound", &SecureTrackError::KeyDerivationError);
+        SecureTrackError::KeyDerivationError
+    })?;
     
-    // Add hardware ID
-    enhanced_password.push_str(hardware_id);
+    // Create result (key + salt)
+    let mut result = Vec::with_capacity(output.len() + salt.len());
+    result.extend_from_slice(&output);
+    result.extend_from_slice(&salt);
     
-    // Derive the key using the enhanced password
-    derive_key_argon2id(&enhanced_password, None, config)
+    Ok(result.into_boxed_slice())
 }
 
 /// Derives a cryptographic key from user identifiers and biometric data
@@ -238,7 +284,7 @@ pub fn derive_key_hardware_bound(
 #[wasm_bindgen]
 pub fn derive_key(
     uid: &str,
-    biometric_hash: Vec<u8>,
+    biometric_hash: &[u8],
     sensor_pattern: &str,
     config: Option<SecurityConfig>,
 ) -> Result<Box<[u8]>> {
@@ -247,44 +293,25 @@ pub fn derive_key(
     
     // Validate inputs
     if biometric_hash.len() != 32 {
+        log_crypto_error("derive_key", &SecureTrackError::InvalidInputError);
         return Err(SecureTrackError::InvalidInputError);
     }
     
-    // Generate a random salt of configured length
+    // Create or get salt
     let mut salt = vec![0u8; config.salt_length];
     OsRng.fill_bytes(&mut salt);
     
-    // Combine inputs for added entropy
-    let combined_input = [
-        uid.as_bytes(),
-        &biometric_hash,
-        sensor_pattern.as_bytes(),
-    ].concat();
-    
-    // Derive key using PBKDF2 with HMAC-SHA256 and configured iterations
-    let mut derived_key = vec![0u8; config.key_length];
-    let _ = pbkdf2::<Hmac<Sha256>>(
-        &combined_input,
-        &salt,
-        config.pbkdf2_iterations,
-        &mut derived_key,
-    );
-    
-    // Return key and salt
-    let mut result = Vec::with_capacity(derived_key.len() + salt.len());
-    result.extend_from_slice(&derived_key);
-    result.extend_from_slice(&salt);
-    
-    Ok(result.into_boxed_slice())
+    derive_key_with_salt(uid, biometric_hash, sensor_pattern, &salt, Some(config))
 }
 
-/// Legacy version of derive_key for backward compatibility
-///
-/// Uses default security parameters (100,000 iterations, 16-byte salt, 32-byte key)
+/// Legacy key derivation function for backward compatibility
+/// 
+/// This function is maintained only for backward compatibility.
+/// New code should use derive_key() instead.
 #[wasm_bindgen]
 pub fn derive_key_legacy(
     uid: &str,
-    biometric_hash: Vec<u8>,
+    biometric_hash: &[u8],
     sensor_pattern: &str,
 ) -> Result<Box<[u8]>> {
     derive_key(uid, biometric_hash, sensor_pattern, None)
@@ -364,69 +391,99 @@ pub fn get_key_from_key_result_legacy(key_result: &[u8]) -> Result<Box<[u8]>> {
     Ok(key.into_boxed_slice())
 }
 
-/// Derives a key using a previously generated salt
+/// Derives a key using a provided salt and security factors
 ///
 /// # Security
-/// This allows recreating a key with the same salt, useful for key recovery
-/// scenarios. Uses configurable number of iterations for security.
+/// Uses a structured approach to combine multiple security factors
+/// (user ID, biometric data, sensor pattern) to generate a strong key.
+/// The factors are combined using HMAC to prevent collisions.
 ///
 /// # Parameters
 /// * `uid` - User identifier string
 /// * `biometric_hash` - 32-byte hash derived from biometric data
 /// * `sensor_pattern` - Device-specific sensor pattern string
-/// * `salt` - Salt previously generated by derive_key
+/// * `salt` - Salt for key derivation
 /// * `config` - Optional security configuration (uses default if None)
 ///
 /// # Returns
-/// * The derived key as a boxed slice
+/// * A boxed slice containing the derived key followed by the salt
 #[wasm_bindgen]
 pub fn derive_key_with_salt(
     uid: &str,
-    biometric_hash: Vec<u8>,
+    biometric_hash: &[u8],
     sensor_pattern: &str,
     salt: &[u8],
     config: Option<SecurityConfig>,
 ) -> Result<Box<[u8]>> {
+    // Use provided config or default
     let config = config.unwrap_or_default();
     
     // Validate inputs
     if biometric_hash.len() != 32 {
+        log_crypto_error("derive_key_with_salt", &SecureTrackError::InvalidInputError);
         return Err(SecureTrackError::InvalidInputError);
     }
     
-    // Combine inputs for added entropy
-    let combined_input = [
-        uid.as_bytes(),
-        &biometric_hash,
-        sensor_pattern.as_bytes(),
-    ].concat();
+    if salt.len() < 16 {
+        log_crypto_error("derive_key_with_salt", &SecureTrackError::InvalidInputError);
+        return Err(SecureTrackError::InvalidInputError);
+    }
     
-    // Derive key using PBKDF2 with HMAC-SHA256 and configured iterations
-    let mut derived_key = vec![0u8; config.key_length];
+    // Combine factors securely using HMAC to prevent collisions
+    // First create an HMAC key from the uid
+    let mut initial_key = [0u8; 32];
     let _ = pbkdf2::<Hmac<Sha256>>(
-        &combined_input,
+        uid.as_bytes(),
+        salt,
+        1000, // Fewer iterations for this initial step
+        &mut initial_key
+    ).map_err(|_| {
+        log_crypto_error("derive_key_with_salt", &SecureTrackError::KeyDerivationError);
+        SecureTrackError::KeyDerivationError
+    })?;
+    
+    // Use the initial key to create a secure combination of the biometric_hash and sensor_pattern
+    let mut mac = Hmac::<Sha256>::new_from_slice(&initial_key)
+        .map_err(|_| {
+            log_crypto_error("derive_key_with_salt", &SecureTrackError::KeyDerivationError);
+            SecureTrackError::KeyDerivationError
+        })?;
+    
+    mac.update(biometric_hash);
+    mac.update(sensor_pattern.as_bytes());
+    
+    let combined_hash = mac.finalize().into_bytes();
+    
+    // Derive the final key using PBKDF2 with the combined factors
+    let mut key = SecretBytes::new(&vec![0u8; config.key_length]);
+    let _ = pbkdf2::<Hmac<Sha256>>(
+        &combined_hash,
         salt,
         config.pbkdf2_iterations,
-        &mut derived_key,
-    );
+        &mut key
+    ).map_err(|_| {
+        log_crypto_error("derive_key_with_salt", &SecureTrackError::KeyDerivationError);
+        SecureTrackError::KeyDerivationError
+    })?;
     
-    Ok(derived_key.into_boxed_slice())
+    // Combine key and salt for the result
+    let mut result = Vec::with_capacity(key.len() + salt.len());
+    result.extend_from_slice(&key);
+    result.extend_from_slice(salt);
+    
+    Ok(result.into_boxed_slice())
 }
 
-/// Legacy version of derive_key_with_salt for backward compatibility
-///
-/// Uses default security parameters (100,000 iterations, 32-byte key)
+/// Legacy function for backwards compatibility
+/// 
+/// This function is maintained only for backward compatibility.
+/// New code should use derive_key_with_salt() instead.
 #[wasm_bindgen]
 pub fn derive_key_with_salt_legacy(
     uid: &str,
-    biometric_hash: Vec<u8>,
+    biometric_hash: &[u8],
     sensor_pattern: &str,
     salt: &[u8],
 ) -> Result<Box<[u8]>> {
-    // Validate inputs
-    if biometric_hash.len() != 32 || salt.len() != 16 {
-        return Err(SecureTrackError::InvalidInputError);
-    }
-    
     derive_key_with_salt(uid, biometric_hash, sensor_pattern, salt, None)
 } 
