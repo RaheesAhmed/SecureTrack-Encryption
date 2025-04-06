@@ -14,9 +14,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 wasm-bindgen = "0.2.86"
 aes-gcm = "0.10.3"
+aes-siv = "0.7.0"
 hmac = "0.12.1"
 sha2 = "0.10.7"
 pbkdf2 = "0.12.2"
+argon2 = "0.5.2"
 rand = { version = "0.8.5", features = ["getrandom"] }
 getrandom = { version = "0.2.10", features = ["js"] }
 serde = { version = "1.0.171", features = ["derive"] }

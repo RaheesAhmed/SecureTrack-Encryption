@@ -1,6 +1,74 @@
 use crate::config::SecurityConfig;
+use crate::errors::{Result, SecureTrackError, log_crypto_error};
 use rand::{RngCore, rngs::OsRng};
 use wasm_bindgen::prelude::*;
+use std::fmt;
+use std::ops::{Deref, DerefMut};
+
+/// A secure container for sensitive data that will be wiped on drop
+/// 
+/// # Security
+/// SecretBytes holds sensitive data (like keys, passwords) in memory
+/// and automatically zeros out memory when dropped.
+pub struct SecretBytes {
+    bytes: Vec<u8>,
+}
+
+impl SecretBytes {
+    /// Create a new secure container with the given data
+    pub fn new(data: &[u8]) -> Self {
+        let mut bytes = vec![0u8; data.len()];
+        bytes.copy_from_slice(data);
+        Self { bytes }
+    }
+    
+    /// Generate random bytes for this container
+    pub fn random(length: usize) -> Self {
+        let mut bytes = vec![0u8; length];
+        OsRng.fill_bytes(&mut bytes);
+        Self { bytes }
+    }
+    
+    /// Convert to a boxed slice (does not zero original memory)
+    pub fn into_boxed_slice(&self) -> Box<[u8]> {
+        self.bytes.clone().into_boxed_slice()
+    }
+    
+    /// Convert to a boxed slice, securely zeroing the original memory
+    pub fn into_boxed_slice_secure(&mut self) -> Box<[u8]> {
+        let result = self.bytes.clone().into_boxed_slice();
+        secure_zero(&mut self.bytes);
+        self.bytes.clear();
+        result
+    }
+}
+
+impl Deref for SecretBytes {
+    type Target = [u8];
+    
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
+impl DerefMut for SecretBytes {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.bytes
+    }
+}
+
+impl Drop for SecretBytes {
+    fn drop(&mut self) {
+        secure_zero(&mut self.bytes);
+    }
+}
+
+// Don't show the secret bytes when debug printing
+impl fmt::Debug for SecretBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SecretBytes({} bytes, content hidden)", self.bytes.len())
+    }
+}
 
 /// Generates a secure random key for encryption or signing
 ///
@@ -18,6 +86,21 @@ pub fn generate_random_key(length: usize) -> Box<[u8]> {
     let mut key = vec![0u8; length];
     OsRng.fill_bytes(&mut key);
     key.into_boxed_slice()
+}
+
+/// Creates a secure container for sensitive data
+///
+/// # Security
+/// This function creates a container for sensitive data that will be
+/// automatically zeroed when it goes out of scope.
+///
+/// # Parameters
+/// * `data` - The sensitive data to protect
+///
+/// # Returns
+/// * The data cloned into a secure container
+pub fn create_secret_container(data: &[u8]) -> SecretBytes {
+    SecretBytes::new(data)
 }
 
 /// Generates a secure random key according to the security configuration
@@ -65,89 +148,112 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// # Security
 /// This function helps prevent sensitive data from lingering in memory
 /// by explicitly overwriting it with zeros. Note that Rust's compiler
-/// optimizations can sometimes interfere with this, but we do our best.
+/// optimizations may affect its behavior.
 ///
 /// # Parameters
-/// * `data` - Mutable slice of data to zero out
+/// * `data` - Data to zero out
 #[wasm_bindgen]
 pub fn secure_zero(data: &mut [u8]) {
-    // Use volatile writes to prevent compiler optimization
-    for byte in data.iter_mut() {
-        volatile_write(byte, 0);
+    // Use volatile writes to prevent optimizations
+    for i in 0..data.len() {
+        unsafe {
+            std::ptr::write_volatile(data.as_mut_ptr().add(i), 0);
+        }
     }
+    
+    // Compiler fence to prevent reordering
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 }
 
-// Helper function for volatile writes to prevent compiler optimization
-fn volatile_write(ptr: &mut u8, value: u8) {
-    unsafe {
-        std::ptr::write_volatile(ptr, value);
-    }
-}
-
-/// Converts a hex string to bytes
+/// Converts a hexadecimal string to bytes
 ///
 /// # Parameters
-/// * `hex` - Hexadecimal string
+/// * `hex` - Hexadecimal string (with or without 0x prefix)
 ///
 /// # Returns
-/// * Byte array as a boxed slice, or None if invalid hex
+/// * Bytes as a boxed slice or an error if the input is invalid
 #[wasm_bindgen]
-pub fn hex_to_bytes(hex: &str) -> Option<Box<[u8]>> {
-    // Ensure even length
+pub fn hex_to_bytes(hex: &str) -> Result<Box<[u8]>> {
+    let hex = hex.trim();
+    let hex = if hex.starts_with("0x") { &hex[2..] } else { hex };
+    
     if hex.len() % 2 != 0 {
-        return None;
+        log_crypto_error("hex_to_bytes", &SecureTrackError::InvalidInputError);
+        return Err(SecureTrackError::InvalidInputError);
     }
     
     let mut result = Vec::with_capacity(hex.len() / 2);
     
     for i in (0..hex.len()).step_by(2) {
-        if let (Some(high), Some(low)) = (
-            from_hex_char(hex.chars().nth(i).unwrap()),
-            from_hex_char(hex.chars().nth(i + 1).unwrap())
-        ) {
-            result.push((high << 4) | low);
-        } else {
-            return None;
+        if i + 2 > hex.len() {
+            break;
         }
+        
+        let byte = u8::from_str_radix(&hex[i..i+2], 16)
+            .map_err(|_| {
+                log_crypto_error("hex_to_bytes", &SecureTrackError::InvalidInputError);
+                SecureTrackError::InvalidInputError
+            })?;
+        
+        result.push(byte);
     }
     
-    Some(result.into_boxed_slice())
+    Ok(result.into_boxed_slice())
 }
 
-/// Converts bytes to a hex string
+/// Converts bytes to a hexadecimal string
 ///
 /// # Parameters
-/// * `bytes` - Byte array
+/// * `bytes` - Bytes to convert
+/// * `with_prefix` - Whether to include 0x prefix
 ///
 /// # Returns
-/// * Hexadecimal string representation
+/// * Hexadecimal string
 #[wasm_bindgen]
-pub fn bytes_to_hex(bytes: &[u8]) -> String {
-    let mut result = String::with_capacity(bytes.len() * 2);
+pub fn bytes_to_hex(bytes: &[u8], with_prefix: bool) -> String {
+    let mut result = if with_prefix { String::from("0x") } else { String::new() };
     
-    for &byte in bytes {
-        result.push(to_hex_char((byte >> 4) & 0xF));
-        result.push(to_hex_char(byte & 0xF));
+    for b in bytes {
+        result.push_str(&format!("{:02x}", b));
     }
     
     result
 }
 
-// Helper function to convert a hex character to its value
-fn from_hex_char(c: char) -> Option<u8> {
-    match c {
-        '0'..='9' => Some(c as u8 - b'0'),
-        'a'..='f' => Some(c as u8 - b'a' + 10),
-        'A'..='F' => Some(c as u8 - b'A' + 10),
-        _ => None,
+/// Performs entropy measurement on a provided passphrase or data
+/// 
+/// # Security
+/// Estimates the bits of entropy in the input data, used for detecting
+/// weak passphrases or inputs.
+/// 
+/// # Parameters
+/// * `data` - Data to measure entropy on
+/// 
+/// # Returns
+/// * Estimated bits of entropy
+#[wasm_bindgen]
+pub fn measure_entropy(data: &[u8]) -> f64 {
+    if data.is_empty() {
+        return 0.0;
     }
-}
-
-// Helper function to convert a nibble to a hex character
-fn to_hex_char(nibble: u8) -> char {
-    match nibble {
-        0..=9 => (b'0' + nibble) as char,
-        10..=15 => (b'a' + (nibble - 10)) as char,
-        _ => unreachable!(),
+    
+    // Count frequencies of each byte
+    let mut frequencies = [0u32; 256];
+    for &byte in data {
+        frequencies[byte as usize] += 1;
     }
+    
+    // Calculate Shannon entropy
+    let mut entropy = 0.0;
+    let len = data.len() as f64;
+    
+    for &count in frequencies.iter() {
+        if count > 0 {
+            let probability = count as f64 / len;
+            entropy -= probability * probability.log2();
+        }
+    }
+    
+    // Return bits of entropy
+    entropy * len
 } 

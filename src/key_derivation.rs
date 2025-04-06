@@ -1,10 +1,213 @@
 use crate::config::SecurityConfig;
-use crate::errors::{Result, SecureTrackError};
+use crate::errors::{Result, SecureTrackError, log_crypto_error};
+use crate::utils::SecretBytes;
 use hmac::{Hmac};
 use pbkdf2::pbkdf2;
+use argon2::{Argon2, Algorithm, Version, Params};
 use rand::{RngCore, rngs::OsRng};
 use sha2::Sha256;
 use wasm_bindgen::prelude::*;
+
+/// Argon2 security configuration parameters
+#[wasm_bindgen]
+#[derive(Clone, Debug)]
+pub struct Argon2Config {
+    /// Memory size in KiB (default: 65536 KiB = 64 MiB)
+    pub memory_size_kib: u32,
+    
+    /// Number of iteration passes (default: 3)
+    pub iterations: u32,
+    
+    /// Degree of parallelism (default: 4)
+    pub parallelism: u32,
+    
+    /// Output length in bytes (default: 32)
+    pub output_length: u32,
+    
+    /// Salt length in bytes (default: 16)
+    pub salt_length: u32,
+}
+
+impl Default for Argon2Config {
+    fn default() -> Self {
+        Self {
+            memory_size_kib: 65536, // 64 MiB
+            iterations: 3,
+            parallelism: 4,
+            output_length: 32,
+            salt_length: 16,
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl Argon2Config {
+    /// Create a new Argon2Config with default values
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    /// Set memory size in KiB
+    #[wasm_bindgen]
+    pub fn with_memory_size(mut self, memory_kib: u32) -> Self {
+        // Minimum 16 MiB for security
+        if memory_kib < 16384 {
+            self.memory_size_kib = 16384;
+        } else {
+            self.memory_size_kib = memory_kib;
+        }
+        self
+    }
+    
+    /// Set iterations
+    #[wasm_bindgen]
+    pub fn with_iterations(mut self, iterations: u32) -> Self {
+        // Minimum 2 iterations
+        if iterations < 2 {
+            self.iterations = 2;
+        } else {
+            self.iterations = iterations;
+        }
+        self
+    }
+    
+    /// Set parallelism
+    #[wasm_bindgen]
+    pub fn with_parallelism(mut self, parallelism: u32) -> Self {
+        // Minimum 1, maximum 16
+        if parallelism < 1 {
+            self.parallelism = 1;
+        } else if parallelism > 16 {
+            self.parallelism = 16;
+        } else {
+            self.parallelism = parallelism;
+        }
+        self
+    }
+}
+
+/// Derives a cryptographic key using Argon2id (recommended for high-security scenarios)
+///
+/// # Security
+/// Uses Argon2id, the state-of-the-art key derivation function that won the 
+/// Password Hashing Competition. Argon2id is highly resistant to both side-channel
+/// attacks and dedicated cracking hardware, making it the best choice for
+/// high-value key derivation.
+///
+/// # Parameters
+/// * `password` - Password or passphrase
+/// * `salt` - Optional salt (generates random salt if None)
+/// * `config` - Optional Argon2 configuration (uses default if None)
+///
+/// # Returns
+/// * A boxed slice containing the derived key followed by the salt
+///
+/// # Example
+/// ```
+/// use securetrack_crypto::{derive_key_argon2id, get_key_from_key_result};
+/// 
+/// let key_result = derive_key_argon2id("strong_password", None, None).unwrap();
+/// let key = get_key_from_key_result(&key_result, None).unwrap();
+/// ```
+#[wasm_bindgen]
+pub fn derive_key_argon2id(
+    password: &str, 
+    salt: Option<Box<[u8]>>, 
+    config: Option<Argon2Config>
+) -> Result<Box<[u8]>> {
+    // Get or create configuration
+    let config = config.unwrap_or_default();
+    
+    // Get or generate salt
+    let salt_bytes = match salt {
+        Some(s) => s.to_vec(),
+        None => {
+            let mut salt = vec![0u8; config.salt_length as usize];
+            OsRng.fill_bytes(&mut salt);
+            salt
+        }
+    };
+    
+    // Validate salt length
+    if salt_bytes.len() < 8 {
+        log_crypto_error("derive_key_argon2id", &SecureTrackError::InvalidInputError);
+        return Err(SecureTrackError::InvalidInputError);
+    }
+    
+    // Create Argon2id context
+    let argon2 = Argon2::new(
+        Algorithm::Argon2id,
+        Version::V0x13,
+        Params::new(
+            config.memory_size_kib,
+            config.iterations,
+            config.parallelism,
+            Some(config.output_length as usize)
+        ).map_err(|_| {
+            log_crypto_error("derive_key_argon2id", &SecureTrackError::KeyDerivationError);
+            SecureTrackError::KeyDerivationError
+        })?
+    );
+    
+    // Derive key
+    let mut output = SecretBytes::new(&vec![0u8; config.output_length as usize]);
+    argon2.hash_password_into(
+        password.as_bytes(),
+        &salt_bytes,
+        &mut output
+    ).map_err(|_| {
+        log_crypto_error("derive_key_argon2id", &SecureTrackError::KeyDerivationError);
+        SecureTrackError::KeyDerivationError
+    })?;
+    
+    // Create result (key + salt)
+    let mut result = Vec::with_capacity(output.len() + salt_bytes.len());
+    result.extend_from_slice(&output);
+    result.extend_from_slice(&salt_bytes);
+    
+    Ok(result.into_boxed_slice())
+}
+
+/// Enhanced key derivation with hardware binding factors
+///
+/// # Security
+/// Uses Argon2id combined with device-specific hardware information to create
+/// keys that are bound to both knowledge factors (password) and hardware
+/// factors (biometrics and sensors).
+///
+/// # Parameters
+/// * `password` - Password or passphrase
+/// * `biometric_factor` - Hash of biometric data (e.g., fingerprint)
+/// * `hardware_id` - Device hardware identifiers
+/// * `config` - Optional Argon2 configuration
+///
+/// # Returns
+/// * A boxed slice containing the derived key followed by the salt
+#[wasm_bindgen]
+pub fn derive_key_hardware_bound(
+    password: &str,
+    biometric_factor: &[u8],
+    hardware_id: &str,
+    config: Option<Argon2Config>
+) -> Result<Box<[u8]>> {
+    // Combine the password with biometric and hardware factors
+    let mut enhanced_password = String::with_capacity(
+        password.len() + biometric_factor.len() + hardware_id.len()
+    );
+    enhanced_password.push_str(password);
+    
+    // Add hex-encoded biometric factor
+    for byte in biometric_factor {
+        enhanced_password.push_str(&format!("{:02x}", byte));
+    }
+    
+    // Add hardware ID
+    enhanced_password.push_str(hardware_id);
+    
+    // Derive the key using the enhanced password
+    derive_key_argon2id(&enhanced_password, None, config)
+}
 
 /// Derives a cryptographic key from user identifiers and biometric data
 ///
@@ -25,9 +228,12 @@ use wasm_bindgen::prelude::*;
 ///
 /// # Example
 /// ```
-/// let key_result = derive_key("user123", biometric_hash, "sensor:pattern", None)?;
-/// let key = get_key_from_key_result(&key_result)?;
-/// let salt = get_salt_from_key_result(&key_result)?;
+/// use securetrack_crypto::{derive_key, get_key_from_key_result, doctest_helpers};
+/// 
+/// let biometric_hash = doctest_helpers::create_test_biometric_hash();
+/// let key_result = derive_key("user123", &biometric_hash, "sensor:pattern", None).unwrap();
+/// let key = get_key_from_key_result(&key_result, None).unwrap();
+/// let salt = get_salt_from_key_result(&key_result, None).unwrap();
 /// ```
 #[wasm_bindgen]
 pub fn derive_key(

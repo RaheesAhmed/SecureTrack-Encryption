@@ -272,17 +272,30 @@ mod tests {
     #[test]
     #[wasm_bindgen_test]
     fn test_hex_conversion() {
-        let bytes = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
-        let hex = bytes_to_hex(&bytes);
+        let bytes = [0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF];
         
+        // Test bytes to hex conversion
+        let hex = bytes_to_hex(&bytes, false);
         assert_eq!(hex, "0123456789abcdef");
         
-        let converted = hex_to_bytes(&hex).unwrap();
-        assert_eq!(&converted[..], &bytes);
+        // Test with prefix
+        let hex_with_prefix = bytes_to_hex(&bytes, true);
+        assert_eq!(hex_with_prefix, "0x0123456789abcdef");
         
-        // Test invalid hex
-        assert!(hex_to_bytes("invalid").is_none());
-        assert!(hex_to_bytes("0123456g").is_none());
+        // Test hex to bytes conversion
+        let converted = hex_to_bytes(&hex).expect("Valid hex should convert correctly");
+        assert_eq!(&converted[..], &bytes[..]);
+        
+        // Test hex to bytes with 0x prefix
+        let converted_with_prefix = hex_to_bytes(&hex_with_prefix).expect("Valid hex with prefix should convert correctly");
+        assert_eq!(&converted_with_prefix[..], &bytes[..]);
+        
+        // Test invalid inputs
+        let invalid_result = hex_to_bytes("invalid");
+        assert!(invalid_result.is_err());
+        
+        let invalid_char_result = hex_to_bytes("0123456g");
+        assert!(invalid_char_result.is_err());
     }
     
     #[test]
